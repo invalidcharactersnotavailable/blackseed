@@ -1,2 +1,5 @@
 # blackseed
-blackseed is a lightweight, modular agent designed for secure system integration and remote orchestration within trusted environments. it supports automated node registration, persistent service deployment, and real-time telemetry reporting. built for red team operations, internal audits, and controlled network simulations, blackseed enables stealth operations while maintaining flexibility for custom post-deployment workflows.
+blackseed is a small project i decided to create to learn a bit more about cybersecurity and red team operations.
+i have decided for the name blackseed: short, neutral, and covert.
+
+its written in go, with only linux support for now.
