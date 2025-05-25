@@ -31,7 +31,7 @@ type ClientManager struct {
 	mu         sync.RWMutex
 }
 
-// Message represents data exchanged between client and server
+// Message represents data exchanged between client and orchestrator
 type Message struct {
 	Type    string `json:"type"`
 	Content string `json:"content"`
@@ -64,9 +64,9 @@ func main() {
 	http.HandleFunc("/clients", handleListClients)
 	http.HandleFunc("/connect", handleClientConnect)
 
-	// Start the server
+	// Start the orchestrator
 	port := 8080
-	log.Printf("Starting server on port %d...", port)
+	log.Printf("Starting orchestrator on port %d...", port)
 	if err := http.ListenAndServe(fmt.Sprintf(":%d", port), nil); err != nil {
 		log.Fatal("ListenAndServe error:", err)
 	}
@@ -395,7 +395,7 @@ func handleHome(w http.ResponseWriter, r *http.Request) {
             terminal.scrollTop = terminal.scrollHeight;
         }
         
-        // Send command to server
+        // Send command to orchestrator
         function sendCommand() {
             const commandInput = document.getElementById('command');
             const command = commandInput.value;
@@ -516,24 +516,18 @@ func handleClient(client *Client) {
 		// Process message
 		var msg Message
 		if err := json.Unmarshal(message, &msg); err != nil {
-			log.Printf("JSON unmarshal error from client %s: %v", client.ID, err)
+			log.Printf("JSON unmarshal error: %v", err)
 			continue
 		}
 
-		log.Printf("Received message from %s: %s", client.ID, string(message))
-
-		// If this is an output message, forward it to all connected operators
-		if msg.Type == "output" {
-			client.mu.Lock()
-			for sessionID, operatorConn := range client.operators {
-				err := operatorConn.WriteJSON(msg)
-				if err != nil {
-					log.Printf("Error forwarding output to operator session %s: %v", sessionID, err)
-					delete(client.operators, sessionID)
-				}
+		// Forward message to all connected operators
+		client.mu.Lock()
+		for _, conn := range client.operators {
+			if err := conn.WriteJSON(msg); err != nil {
+				log.Printf("Write error to operator: %v", err)
 			}
-			client.mu.Unlock()
 		}
+		client.mu.Unlock()
 	}
 }
 
@@ -556,7 +550,7 @@ func handleListClients(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(clients)
 }
 
-// handleClientConnect handles WebSocket connections from the operator to a specific client
+// handleClientConnect handles WebSocket connections from operators to clients
 func handleClientConnect(w http.ResponseWriter, r *http.Request) {
 	clientID := r.URL.Query().Get("id")
 	if clientID == "" {
@@ -566,7 +560,7 @@ func handleClientConnect(w http.ResponseWriter, r *http.Request) {
 
 	// Check if client exists
 	manager.mu.RLock()
-	targetClient, exists := manager.clients[clientID]
+	client, exists := manager.clients[clientID]
 	manager.mu.RUnlock()
 
 	if !exists {
@@ -581,106 +575,38 @@ func handleClientConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Create a unique session ID for this operator connection
-	sessionID := uuid.New().String()
-	log.Printf("Operator connected to client %s with session %s", clientID, sessionID)
+	// Generate operator ID
+	operatorID := uuid.New().String()
 
-	// Register this operator connection with the client
-	targetClient.mu.Lock()
-	targetClient.operators[sessionID] = conn
-	targetClient.mu.Unlock()
+	// Add operator connection to client
+	client.mu.Lock()
+	client.operators[operatorID] = conn
+	client.mu.Unlock()
 
-	// Send initial welcome message
-	welcomeMsg := Message{
-		Type: "output",
-		Content: fmt.Sprintf("Connected to %s (%s)\nUser: %s | Shell: %s\n$ ",
-			targetClient.Hostname, targetClient.ID, targetClient.User, targetClient.Shell),
-	}
-	conn.WriteJSON(welcomeMsg)
-
-	// Handle operator commands
-	go handleOperatorCommands(conn, targetClient, sessionID)
+	// Handle operator messages
+	go handleOperator(client, operatorID, conn)
 }
 
-// handleOperatorCommands processes commands from the operator and forwards them to the client
-func handleOperatorCommands(conn *websocket.Conn, targetClient *Client, sessionID string) {
+// handleOperator processes messages from an operator to a client
+func handleOperator(client *Client, operatorID string, conn *websocket.Conn) {
 	defer func() {
 		conn.Close()
-		targetClient.mu.Lock()
-		delete(targetClient.operators, sessionID)
-		targetClient.mu.Unlock()
-		log.Printf("Operator session %s disconnected", sessionID)
+		client.mu.Lock()
+		delete(client.operators, operatorID)
+		client.mu.Unlock()
 	}()
 
 	for {
-		// Read message from operator
-		_, msg, err := conn.ReadMessage()
+		_, message, err := conn.ReadMessage()
 		if err != nil {
-			log.Printf("Operator session %s disconnected: %v", sessionID, err)
+			log.Printf("Read error from operator %s: %v", operatorID, err)
 			break
 		}
 
-		// Parse message
-		var message Message
-		if err := json.Unmarshal(msg, &message); err != nil {
-			log.Printf("Invalid message format from operator session %s: %v", sessionID, err)
-			continue
-		}
-
-		log.Printf("Received message from operator session %s: %+v", sessionID, message)
-
-		// Forward message to target client based on type
-		switch message.Type {
-		case "command":
-			log.Printf("Forwarding command to client %s: %s", targetClient.ID, message.Content)
-			targetClient.mu.Lock()
-			err := targetClient.Conn.WriteJSON(message)
-			targetClient.mu.Unlock()
-
-			if err != nil {
-				log.Printf("Error sending command to client %s: %v", targetClient.ID, err)
-				errorMsg := Message{
-					Type:    "error",
-					Content: "Failed to send command to client: " + err.Error(),
-				}
-				conn.WriteJSON(errorMsg)
-			}
-
-		case "shell_change":
-			log.Printf("Forwarding shell change request to client %s: %s", targetClient.ID, message.Shell)
-			targetClient.mu.Lock()
-			err := targetClient.Conn.WriteJSON(message)
-			targetClient.mu.Unlock()
-
-			if err != nil {
-				log.Printf("Error sending shell change to client %s: %v", targetClient.ID, err)
-				errorMsg := Message{
-					Type:    "error",
-					Content: "Failed to send shell change request: " + err.Error(),
-				}
-				conn.WriteJSON(errorMsg)
-			} else {
-				// Update client shell in our records
-				targetClient.Shell = message.Shell
-			}
-
-		case "user_change":
-			log.Printf("Forwarding user change request to client %s: %s", targetClient.ID, message.User)
-			targetClient.mu.Lock()
-			err := targetClient.Conn.WriteJSON(message)
-			targetClient.mu.Unlock()
-
-			if err != nil {
-				log.Printf("Error sending user change to client %s: %v", targetClient.ID, err)
-				errorMsg := Message{
-					Type:    "error",
-					Content: "Failed to send user change request: " + err.Error(),
-				}
-				conn.WriteJSON(errorMsg)
-			} else {
-				// Update client user in our records
-				targetClient.User = message.User
-			}
+		// Forward message to client
+		if err := client.Conn.WriteMessage(websocket.TextMessage, message); err != nil {
+			log.Printf("Write error to client %s: %v", client.ID, err)
+			break
 		}
 	}
 }
